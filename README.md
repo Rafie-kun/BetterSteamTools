@@ -100,6 +100,11 @@ The `extract_tickets` tool dumps the `AppTicket` and `ETicket` hex strings you n
 
 ### Online Fix
 - Add `-onlinefix` to the Steam launch parameters to enable 480-based online play in games that use lobby matchmaking. The current limitation is that only one such game can run at a time.To revert, simply remove -onlinefix from the launch parameters — online play returns to normal on the next launch.
+- Add `-realappid` alongside `-onlinefix` if the game **launches but then hangs, black-screens or misbehaves after login**.
+
+  Once P2P starts, `-onlinefix` normally reports the fake AppId (480) when the game asks Steam *which game am I* — some titles need that for their networking to line up. Others read the same answer during startup, get 480 instead of their own AppId, and break on it. `-realappid` keeps the 480 spoof everywhere else (so ownership and matchmaking still work) while answering that one question honestly.
+
+  Known to need it: Bodycam (2406770). If a game works without it, leave it off.
 
 ## Future
 - Steam Cloud synchronization support.(This is a huge project)
