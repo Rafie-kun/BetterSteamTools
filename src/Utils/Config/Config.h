@@ -47,6 +47,18 @@ namespace Config {
     bool GetStatsEnableApi();
     bool GetUpdateEnabled();
 
+    // [donate] — contribute manifest request codes for depots this account owns.
+    struct DonateSettings {
+        bool        enabled  = true;
+        std::string url;                       // base; empty = built-in default
+        uint32_t    intervalSecs        = 30;
+        uint32_t    maxMintsPerCycle    = 25;
+        uint32_t    minMintIntervalMs   = 2000;
+        uint32_t    maxMintsPerSession  = 0;     // 0 = unlimited (mint all session)
+        uint32_t    wantedRefreshSecs   = 300;   // re-pull the (large) wanted list only this often; minting still runs every intervalSecs
+    };
+    DonateSettings GetDonateSettings();
+
     // [manifest] — provider selection lives in ManifestClient (table-driven).
     inline uint32_t manifestTimeoutResolve = 5000;
     inline uint32_t manifestTimeoutConnect = 5000;
@@ -70,6 +82,12 @@ namespace Config {
 
     // [update] - self-update check on startup (staged for next Steam launch).
     inline bool updateEnabled = true;
+
+    // [donate] - mint manifest request codes on request for depots this account
+    // owns. Codes are bound to (depot, manifest) and rotate within minutes, so
+    // they are minted on demand and sent straight on, never stored. The caps
+    // exist because this calls Steam as the signed-in user.
+    inline DonateSettings donate;
 
     // [[inject]] - optional DLL injection into matching game processes.
     inline std::vector<InjectDll> injectDlls;

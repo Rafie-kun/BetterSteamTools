@@ -19,6 +19,7 @@ namespace {
         std::vector<std::string> remoteUrlTemplates;
         bool statsEnableApi = true;
         bool updateEnabled = true;
+        DonateSettings donate;
         std::vector<InjectDll> injectDlls;
         CloudSettings cloud;
     };
@@ -55,6 +56,7 @@ namespace {
         remoteUrlTemplates     = snapshot.remoteUrlTemplates;
         statsEnableApi         = snapshot.statsEnableApi;
         updateEnabled          = snapshot.updateEnabled;
+        donate                 = snapshot.donate;
         injectDlls             = snapshot.injectDlls;
         cloudEnabled           = snapshot.cloud.enabled;
         cloudLibrary           = snapshot.cloud.library;
@@ -161,6 +163,30 @@ namespace {
                 }
             }
 
+            // [donate]
+            if (auto donate = tbl["donate"].as_table()) {
+                if (auto v = (*donate)["enabled"].value<bool>())        snapshot.donate.enabled = *v;
+                if (auto v = (*donate)["url"].value<std::string>())     snapshot.donate.url = *v;
+
+                // Clamped rather than trusted: a mistyped 0 here would mean an
+                // unthrottled loop hammering Steam as the signed-in user.
+                auto readClamped = [&](const char* key, uint32_t lo, uint32_t hi, uint32_t& out) {
+                    auto v = (*donate)[key].value<int64_t>();
+                    if (!v) return;
+                    if (*v < lo || *v > hi) {
+                        LOG_WARN("[donate] {} = {} out of range [{}, {}], keeping {}",
+                                 key, *v, lo, hi, out);
+                        return;
+                    }
+                    out = static_cast<uint32_t>(*v);
+                };
+                readClamped("interval_secs",        30,  86400, snapshot.donate.intervalSecs);
+                readClamped("max_mints_per_cycle",   1,    500, snapshot.donate.maxMintsPerCycle);
+                readClamped("min_mint_interval_ms",  0,  60000, snapshot.donate.minMintIntervalMs);
+                readClamped("max_mints_per_session", 0, 100000, snapshot.donate.maxMintsPerSession);
+                readClamped("wanted_refresh_secs",  30,  86400, snapshot.donate.wantedRefreshSecs);
+            }
+
             // [[inject]]
             if (auto arr = tbl["inject"].as_array()) {
                 std::filesystem::path steamDir = std::filesystem::path(configPath).parent_path();
@@ -261,6 +287,11 @@ namespace {
     bool GetStatsEnableApi() {
         std::lock_guard lock(g_mutex);
         return statsEnableApi;
+    }
+
+    DonateSettings GetDonateSettings() {
+        std::lock_guard lock(g_mutex);
+        return donate;
     }
 
     bool GetUpdateEnabled() {
