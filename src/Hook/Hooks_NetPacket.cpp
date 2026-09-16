@@ -39,24 +39,30 @@ namespace {
     constexpr int    kPacketPoolSize = 8;
 
     // ── Incoming (RecvPkt) packet pool ─────────────────────
-    uint8  g_NewBody[kMaxBodySize];
-    uint32 g_cbNewBody   = 0;
-    uint8  g_NewHdr[kMaxHdrSize];
-    uint32 g_cbNewHdr    = 0;
-    bool   g_NeedReplaceBody = false;
-    bool   g_NeedReplaceHdr  = false;
-    bool   g_ResizedInPlace = false;
-    uint32 g_NewBodySize    = 0;
-    uint8  g_RecvPacketPool[kPacketPoolSize][kMaxPacketSize];
-    int    g_RecvPacketPoolIdx = 0;
+    // NOTE: Steam dispatches network packets on more than one thread. These
+    // used to be plain globals, so two concurrent RecvPkt calls overwrote each
+    // other's replacement header/body and one depot's manifest code could land
+    // in another depot's reply (random 401s / downloads resetting to 0%).
+    // thread_local keeps each network thread on its own scratch space; the
+    // HandleRecv -> ReplaceRecvPacket use is always same-thread.
+    thread_local uint8  g_NewBody[kMaxBodySize];
+    thread_local uint32 g_cbNewBody   = 0;
+    thread_local uint8  g_NewHdr[kMaxHdrSize];
+    thread_local uint32 g_cbNewHdr    = 0;
+    thread_local bool   g_NeedReplaceBody = false;
+    thread_local bool   g_NeedReplaceHdr  = false;
+    thread_local bool   g_ResizedInPlace = false;
+    thread_local uint32 g_NewBodySize    = 0;
+    thread_local uint8  g_RecvPacketPool[kPacketPoolSize][kMaxPacketSize];
+    thread_local int    g_RecvPacketPoolIdx = 0;
 
     // ── Outgoing (BBuildAndAsyncSendFrame) — same pattern ───────
-    uint8  g_SendNewBody[kMaxBodySize];
-    uint32 g_cbSendNewBody = 0;
-    bool   g_NeedReplaceSend = false;
-    bool   g_SuppressSend    = false;   // drop the outbound frame entirely (cloud RPC answered locally)
-    uint8  g_SendPacketPool[kPacketPoolSize][kMaxPacketSize];
-    int    g_SendPacketPoolIdx = 0;
+    thread_local uint8  g_SendNewBody[kMaxBodySize];
+    thread_local uint32 g_cbSendNewBody = 0;
+    thread_local bool   g_NeedReplaceSend = false;
+    thread_local bool   g_SuppressSend    = false;   // drop the outbound frame entirely (cloud RPC answered locally)
+    thread_local uint8  g_SendPacketPool[kPacketPoolSize][kMaxPacketSize];
+    thread_local int    g_SendPacketPoolIdx = 0;
 
     // ── EMsg -> name lookup  ─────────────────────────
     RESOLVE_FUNC(PchMsgNameFromEMsg, char*, EMsg eMsg);
@@ -840,15 +846,26 @@ namespace Hooks_NetPacket_ManifestProbe {
 //  Incoming: ContentServerDirectory.GetManifestRequestCode#1  (eMsg 147)
 //
 //  Launches an async HTTP fetch on send; the recv handler waits up to
-//  12 s for the result and patches both header (eresult=OK) and body
-//  (manifest_request_code).  On timeout or failure the original
+//  kMaxWaitSeconds for the result and patches both header (eresult=OK) and
+//  body (manifest_request_code).  On timeout or failure the original
 //  response passes through unmodified.
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_Manifest {
 
-    std::unordered_map<uint64, std::shared_future<uint64>> g_CodeFutures;
+    struct CodeFetch {
+        std::shared_future<uint64> future;
+        std::chrono::steady_clock::time_point created;
+    };
+    std::unordered_map<uint64, CodeFetch> g_CodeFutures;
     std::mutex g_CodeMutex;
-    constexpr uint32 kMaxWaitSeconds = 12;
+    // HTTP fetch budget is resolve+connect+send+recv = 5+5+10+10 = 30 s worst
+    // case (plus Lua http_get). The old 12 s waiter timed out on any slow edge
+    // and the download failed (reset to 0%) while the fetch completed a moment
+    // later — the classic "random fail, retry works". Wait out the full budget.
+    constexpr uint32 kMaxWaitSeconds = 30;
+    // Replies that never arrive (batched inside k_EMsgMulti, which RecvJob
+    // skips, or a dropped job) must not leak map entries forever.
+    constexpr auto kFutureStaleAfter = std::chrono::seconds(120);
 
     // Passive capture: jobid_source -> (depot, gid) for every outgoing request,
     // so HandleRecv can harvest the genuine code Steam returns for depots this
@@ -905,10 +922,23 @@ namespace Hooks_NetPacket_Manifest {
         // tests OwnedAppIdSet, which MarkOwned fills with *app* ids, against the
         // *depot* id passed here. BuildDepotDependency has already recorded the
         // depot -> app mapping (it runs seconds earlier), so bridge through that.
+        // Fallback: on restart / resume the code request can arrive BEFORE
+        // BuildDepotDependency runs this session, so the map is still empty.
+        // The request itself usually carries app_id — if that app is owned,
+        // leave Steam's code alone too. Without this, an owned depot gets a
+        // carrier-minted code injected, the CDN 401s it, and the download
+        // resets to 0%.
         AppId_t  seenApp = 0;
         uint64_t seenGid = 0;
+        bool ownedDepot = false;
         if (Hooks_Manifest::LookupDepot(depotId, seenApp, seenGid) &&
             seenApp && LuaConfig::IsOwned(seenApp)) {
+            ownedDepot = true;
+        } else if (appId && LuaConfig::IsOwned(appId)) {
+            seenApp = appId;
+            ownedDepot = true;
+        }
+        if (ownedDepot) {
             LOG_MANIFEST_INFO("GetManifestRequestCode: depot={} belongs to owned app {}, "
                               "leaving Steam's own code alone", depotId, seenApp);
             return false;
@@ -946,10 +976,19 @@ namespace Hooks_NetPacket_Manifest {
             // download). Use "is any app actively downloading": true during a real
             // user download, false at idle startup when Steam is only retrying its
             // scheduled-update queue.
+            // NOTE: the archive check below always bypasses the negative cache.
+            // A pause -> resume inside the 10 min negative window must re-GET:
+            // the donor may have supplied the manifest while paused, and the UI
+            // active-flag can lag the network thread on resume, so gating the
+            // bypass on `active` caused resume to ride a stale 404 and reset to
+            // 0%. Steady-state cost is nil — archived manifests hit the
+            // fs::exists short-circuit and never GET again; only genuinely
+            // missing manifests re-GET on each ~30 s retry. `active` still gates
+            // the "not ready" popup so idle retries stay silent.
             const bool active = Hooks_SteamUI::ActiveDownloadCount() > 0;
             OSTPlatform::Thread::StartDetached([a, d, g, active]() -> uint32_t {
                 bool notArchived = false;
-                bool ok = ManifestCache::EnsureCached(a, d, g, 0, &notArchived, /*bypassNeg=*/active);
+                bool ok = ManifestCache::EnsureCached(a, d, g, 0, &notArchived, /*bypassNeg=*/true);
                 if (active && !ok && notArchived)
                     Hooks_Manifest::ReportMissingManifest(d, g);
                 return 0;
@@ -972,7 +1011,16 @@ namespace Hooks_NetPacket_Manifest {
 
         {
             std::lock_guard<std::mutex> lock(g_CodeMutex);
-            g_CodeFutures[jobId] = task.share();
+            // Sweep replies that never arrived (e.g. batched inside
+            // k_EMsgMulti, which RecvJob skips) so the map stays bounded.
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = g_CodeFutures.begin(); it != g_CodeFutures.end(); ) {
+                if (now - it->second.created > kFutureStaleAfter)
+                    it = g_CodeFutures.erase(it);
+                else
+                    ++it;
+            }
+            g_CodeFutures[jobId] = CodeFetch{task.share(), now};
         }
 
         return false; // Don't modify the outgoing request body
@@ -1023,7 +1071,7 @@ namespace Hooks_NetPacket_Manifest {
             std::lock_guard<std::mutex> lock(g_CodeMutex);
             auto it = g_CodeFutures.find(jobId);
             if (it == g_CodeFutures.end()) return;
-            future = it->second;
+            future = it->second.future;
             g_CodeFutures.erase(it); // Always clean up immediately
         }
         // Wait up to kMaxWaitSeconds seconds for the HTTP fetch to complete

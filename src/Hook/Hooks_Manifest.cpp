@@ -187,20 +187,28 @@ namespace {
         const auto& overrides = LuaConfig::GetManifestOverrides();
 
         // Apply manifest overrides in place (only depots a lua explicitly pins).
-        if (!overrides.empty() && pDepotInfo && pDepotInfo->m_Size) {
-            for (uint32 i = 0; i < pDepotInfo->m_Size; ++i) {
-                DepotEntry& e = pDepotInfo->m_Memory.m_pMemory[i];
-                auto it = overrides.find(e.DepotId);
-                if (it != overrides.end()) {
-                    // if size=0 in the override, keep the original size(affects download display but not the actual download)
-                    uint64_t newSize = it->second.size ? it->second.size : e.ManifestSize;
-                    LOG_MANIFEST_INFO("BuildDepotDependency: patching depot {} gid={}->{} size={}->{}",
-                        e.DepotId, e.ManifestGid, it->second.gid,
-                        e.ManifestSize, newSize);
-                    e.ManifestGid  = it->second.gid;
-                    e.ManifestSize = newSize;
+        // Both lists: a pinned depot can arrive via pSharedDepotInfo (shared
+        // installs), and preseeding below runs on both — patching only
+        // pDepotInfo left shared depots preseeding/requesting the wrong GID.
+        if (!overrides.empty()) {
+            auto patchVec = [&](CUtlVector<DepotEntry>* vec) {
+                if (!vec || !vec->m_Size) return;
+                for (uint32 i = 0; i < vec->m_Size; ++i) {
+                    DepotEntry& e = vec->m_Memory.m_pMemory[i];
+                    auto it = overrides.find(e.DepotId);
+                    if (it != overrides.end()) {
+                        // if size=0 in the override, keep the original size(affects download display but not the actual download)
+                        uint64_t newSize = it->second.size ? it->second.size : e.ManifestSize;
+                        LOG_MANIFEST_INFO("BuildDepotDependency: patching depot {} gid={}->{} size={}->{}",
+                            e.DepotId, e.ManifestGid, it->second.gid,
+                            e.ManifestSize, newSize);
+                        e.ManifestGid  = it->second.gid;
+                        e.ManifestSize = newSize;
+                    }
                 }
-            }
+            };
+            patchVec(pDepotInfo);
+            patchVec(pSharedDepotInfo);
         }
 
         // Pre-seed <steam>\depotcache SYNCHRONOUSLY for every depot OST is

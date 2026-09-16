@@ -98,8 +98,7 @@ namespace ManifestClient {
 
     // ── fetch ─────────────────────────────────────────────────────
 
-    static bool FetchActive(uint64_t gid, uint64_t* outCode, AppId_t appId, AppId_t depotId) {
-        const Provider& p = *g_active;
+    static bool FetchActive(const Provider& p, uint64_t gid, uint64_t* outCode, AppId_t appId, AppId_t depotId) {
         const Config::ManifestTimeouts timeouts = Config::GetManifestTimeouts();
 
         // app_id does not change the code — it only satisfies Steam's access
@@ -138,24 +137,38 @@ namespace ManifestClient {
     bool FetchManifestRequestCode(uint64_t manifestGid, uint64_t* outRequestCode,
                                   AppId_t appId, AppId_t depotId)
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        // The lua_State is single and not thread-safe, so the Lua phase stays
+        // serialized. But the old code held g_mutex across the HTTP fetch too,
+        // which serialized ALL depot fetches: with N depots the Nth job waited
+        // ~N x HTTP time while HandleRecv only waits kMaxWaitSeconds, so large
+        // games timed out randomly (download resets to 0%, retry works). Copy
+        // the active provider under the lock, run Lua under the lock, then do
+        // the network fetch with no lock held.
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
 
-        if (appId && depotId && LuaConfig::HasManifestCodeFuncEx()) {
-            if (LuaConfig::CallManifestFetchCodeEx(appId, depotId, manifestGid, outRequestCode)) {
-                LOG_MANIFEST_INFO("Manifest gid={} resolved via fetch_manifest_code_ex", manifestGid);
-                return true;
+            if (appId && depotId && LuaConfig::HasManifestCodeFuncEx()) {
+                if (LuaConfig::CallManifestFetchCodeEx(appId, depotId, manifestGid, outRequestCode)) {
+                    LOG_MANIFEST_INFO("Manifest gid={} resolved via fetch_manifest_code_ex", manifestGid);
+                    return true;
+                }
+                LOG_MANIFEST_WARN("Manifest gid={} fetch_manifest_code_ex returned nil, trying fetch_manifest_code", manifestGid);
             }
-            LOG_MANIFEST_WARN("Manifest gid={} fetch_manifest_code_ex returned nil, trying fetch_manifest_code", manifestGid);
+
+            if (LuaConfig::HasManifestCodeFunc()) {
+                if (LuaConfig::CallManifestFetchCode(manifestGid, outRequestCode)) {
+                    LOG_MANIFEST_INFO("Manifest gid={} resolved via manifest.lua", manifestGid);
+                    return true;
+                }
+                LOG_MANIFEST_WARN("Manifest gid={} lua returned nil, falling back to config", manifestGid);
+            }
         }
 
-        if (LuaConfig::HasManifestCodeFunc()) {
-            if (LuaConfig::CallManifestFetchCode(manifestGid, outRequestCode)) {
-                LOG_MANIFEST_INFO("Manifest gid={} resolved via manifest.lua", manifestGid);
-                return true;
-            }
-            LOG_MANIFEST_WARN("Manifest gid={} lua returned nil, falling back to config", manifestGid);
+        Provider active;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            active = *g_active;
         }
-
-        return FetchActive(manifestGid, outRequestCode, appId, depotId);
+        return FetchActive(active, manifestGid, outRequestCode, appId, depotId);
     }
 }

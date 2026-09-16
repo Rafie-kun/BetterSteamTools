@@ -7,6 +7,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -96,9 +98,13 @@ namespace {
         std::error_code ec;
         fs::create_directories(dest.parent_path(), ec); // no-op if it exists
 
-        // Unique-ish temp beside the target so the rename stays on one volume.
+        // Unique temp beside the target so the rename stays on one volume.
+        // Thread id alone is not unique under re-entrancy (same thread fetching
+        // the same depot twice), so add a sequence number.
+        static std::atomic<uint64_t> s_tmpSeq{0};
+        const uint64_t seq = s_tmpSeq.fetch_add(1, std::memory_order_relaxed);
         const fs::path tmp = fs::path(dest).concat(
-            std::format(".{}.tmp", ::GetCurrentThreadId()));
+            std::format(".{}.{}.tmp", ::GetCurrentThreadId(), seq));
 
         {
             std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
@@ -161,7 +167,22 @@ bool EnsureCached(AppId_t app, uint32_t depot, uint64_t gid,
     }
 
     InFlightGuard guard(key);
-    if (!guard.acquired) return false; // another worker is already on it
+    if (!guard.acquired) {
+        // Another worker is already fetching this exact depot:gid (preseed
+        // sweep racing a real code request, or two depots lists at once). The
+        // old code returned false immediately, so the loser reported a miss
+        // even though the manifest landed a moment later — first-press
+        // download failed and reset to 0%, retry worked. Wait briefly for the
+        // winner instead; outNotArchived stays false (no fresh 404 signal).
+        constexpr auto kJoinWait = std::chrono::seconds(10);
+        constexpr auto kJoinStep = std::chrono::milliseconds(100);
+        const auto joinDeadline = std::chrono::steady_clock::now() + kJoinWait;
+        do {
+            std::this_thread::sleep_for(kJoinStep);
+            if (fs::exists(dest, ec)) return true;
+        } while (std::chrono::steady_clock::now() < joinDeadline);
+        return false;
+    }
 
     // Re-check after taking the slot: the other worker may have just finished.
     if (fs::exists(dest, ec)) return true;
