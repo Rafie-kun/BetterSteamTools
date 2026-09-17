@@ -179,6 +179,17 @@ paths = []
 # when_appids = [1361510]             # optional: restrict to these appids (default: any)
 # all_games = false                   # optional: true injects into every game, false only into Lua-added games (default: false)
 
+# Contribute manifest request codes for depots THIS account owns, so other users can
+# download those games. Only depots the archive asks for and this account owns are
+# ever mentioned; set enabled = false to opt out.
+[donate]
+enabled = true
+# interval_secs         = 30     # pause between cycles
+# wanted_refresh_secs   = 300    # how often the wanted list is re-fetched
+# max_mints_per_cycle   = 25     # most codes requested from Steam in one cycle
+# min_mint_interval_ms  = 2000   # minimum gap between requests to Steam
+# max_mints_per_session = 0      # 0 = no limit for the Steam session
+
 # Optional metadata mirror. See "Steam version compatibility" below.
 [remote]
 # url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
