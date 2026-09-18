@@ -111,13 +111,26 @@ namespace {
         });
     }
 
-    // Synchronously ensure the archived manifest for each OST-served depot is on
-    // disk before we hand the depot list back to Steam. A depot is OST-served
-    // when it is pinned by a lua (an override) or lua-unlocked but not genuinely
-    // owned — genuinely-owned depots get working codes from Steam and are left
-    // alone, mirroring HandleSend's policy. Fetches run within a shared wall-clock
-    // deadline; past it, remaining depots are fetched detached so Steam is never
-    // hung. Already-cached depots cost only a stat.
+    // Synchronously ensure the archived manifest is on disk before we hand the
+    // depot list back to Steam — but ONLY for depots a lua explicitly pins.
+    //
+    // The point of pre-seeding is to fetch the manifest the download is KNOWN to
+    // use, and a setManifestid pin is the only thing that states that gid. It was
+    // patched into e.ManifestGid by the override pass just above, so a pinned
+    // entry is correct by construction.
+    //
+    // Every other lua depot is deliberately skipped. Here e.ManifestGid is only
+    // whatever Steam had cached from appinfo, which is not the gid Steam will end
+    // up requesting (see the note in Hooks_NetPacket_Manifest::HandleSend), so
+    // fetching on it is a guess: it either 404s or lands a manifest Steam never
+    // reads. Those depots are already covered on demand by that same HandleSend,
+    // which fires with the gid Steam states outright. Commenting out a pin puts a
+    // depot in exactly this bucket — its addappid line keeps the depot key, but
+    // without the pin there is no known gid to pre-seed.
+    //
+    // Fetches run within a shared wall-clock deadline; past it, remaining depots
+    // are fetched detached so Steam is never hung. Already-cached depots cost only
+    // a stat.
     void PreseedDepots(AppId_t appId, const CUtlVector<DepotEntry>* vec,
                        const std::unordered_map<uint64_t, LuaConfig::ManifestOverride>& overrides,
                        std::chrono::steady_clock::time_point deadline)
@@ -127,10 +140,7 @@ namespace {
             const DepotEntry& e = vec->m_Memory.m_pMemory[i];
             if (!e.DepotId || !e.ManifestGid) continue;
 
-            const bool pinned   = overrides.count(e.DepotId) != 0;
-            const bool unlocked = LuaConfig::HasDepot(e.DepotId, false) &&
-                                  !LuaConfig::IsOwned(e.AppId);
-            if (!pinned && !unlocked) continue;   // owned/normal depot: Steam handles it
+            if (!overrides.count(e.DepotId)) continue;   // not pinned: HandleSend owns it
 
             const AppId_t app   = appId;
             const uint32  depot = e.DepotId;
@@ -211,14 +221,13 @@ namespace {
             patchVec(pSharedDepotInfo);
         }
 
-        // Pre-seed <steam>\depotcache SYNCHRONOUSLY for every depot OST is
-        // responsible for, using the gid Steam just reported (or the pinned gid
-        // patched above). Doing this before returning means the manifest is on
-        // disk before Steam's first manifest-request-code call, so an unlocked
-        // install starts on the first press instead of failing and needing a
-        // retry. Bounded: each fetch has a short timeout, and once the total
-        // budget is spent the rest fall back to a detached fetch so a large or
-        // slow install can never hang Steam's thread. Already-cached depots cost
+        // Pre-seed <steam>\depotcache SYNCHRONOUSLY for every lua-pinned depot,
+        // using the pinned gid patched in above. Doing this before returning means
+        // the manifest is on disk before Steam's first manifest-request-code call,
+        // so a pinned install starts on the first press instead of failing and
+        // needing a retry. Bounded: each fetch has a short timeout, and once the
+        // total budget is spent the rest fall back to a detached fetch so a large
+        // or slow install can never hang Steam's thread. Already-cached depots cost
         // only a stat (EnsureCached's fs::exists short-circuit), so this is cheap
         // except on a genuinely new install.
         const auto deadline = std::chrono::steady_clock::now() +
@@ -228,6 +237,33 @@ namespace {
         return result;
     }
 
+    // ── Workshop / on-demand manifest pre-seed ──────────────────────────
+    // CDepotDownloadMgr's per-manifest acquire (steamclient: sub_1384B97C0). It
+    // builds <steam>\depotcache\<depot>_<gid>.manifest, checks disk, and only
+    // falls through to BYldRequestDepotManifest (the request-code path) on a
+    // miss. Pre-seeding the manifest here — before the original's own disk check
+    // — makes that check succeed, so the download starts on the FIRST attempt
+    // with no request code. Unlike BuildDepotDependency this fires for every
+    // manifest acquisition, including workshop items (depot == appid), which
+    // never pass through BuildDepotDependency.
+    //
+    //   appId=a3, depotId=a4, manifestGid=a5, branch=a6.
+    HOOK_FUNC(YldLoadDepotManifest, __int64,
+              void* a1, void* a2, int appId, uint32_t depotId,
+              uint64_t manifestGid, const char* branch)
+    {
+        // Only depots OST unlocks and does not own (lua-added, incl. workshop
+        // apps). A bounded blocking fetch: the original checks disk on the very
+        // next line, so an archive hit converts into a first-attempt success; a
+        // miss just returns and the original takes its normal request-code path.
+        if ( depotId && manifestGid && LuaConfig::HasDepot(depotId) ) {
+            LOG_MANIFEST_DEBUG("YldLoadDepotManifest: pre-seed app={} depot={} gid={} branch={}",
+                               appId, depotId, manifestGid, branch ? branch : "");
+            ManifestCache::EnsureCached(appId, depotId, manifestGid, kPreseedFetchTimeoutMs);
+        }
+        return oYldLoadDepotManifest(a1, a2, appId, depotId, manifestGid, branch);
+    }
+
 } // anonymous namespace
 
 namespace Hooks_Manifest {
@@ -235,12 +271,14 @@ namespace Hooks_Manifest {
     void Install() {
         HOOK_BEGIN();
         INSTALL_HOOK_C(BuildDepotDependency);
+        INSTALL_HOOK_C(YldLoadDepotManifest);
         HOOK_END();
     }
 
     void Uninstall() {
         UNHOOK_BEGIN();
         UNINSTALL_HOOK(BuildDepotDependency);
+        UNINSTALL_HOOK(YldLoadDepotManifest);
         UNHOOK_END();
     }
 
