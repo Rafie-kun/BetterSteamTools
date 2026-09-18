@@ -15,6 +15,7 @@
 #include "Utils/Tickets/EticketClient.h"
 #include "Utils/Support/FnvHash.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
+#include "Utils/Stats/LocalStats.h"
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -374,8 +375,191 @@ namespace Hooks_NetPacket_UserStats {
         return true;
     }
 
+    // ── Send: CMsgClientStoreUserStats (eMsg 820) / StoreUserStats2 (5466) ──
+    //
+    //  Local-only stat stores. With [stats] local_only (default), stores for
+    //  Lua-unlocked games never reach Valve: the (stat_id, stat_value) pairs
+    //  are journaled to LocalStats (achievements travel as stat bits — there
+    //  is no separate unlock list on the wire), CloudRedirect is still
+    //  notified so its sync keeps working, the outbound frame is suppressed,
+    //  and a synthesized 821 success is delivered so the game sees StoreStats
+    //  succeed and the client shows the unlock toast. Nothing lands on the
+    //  online profile. Owned games are untouched (normal online behavior).
+    std::mutex                     g_storeMutex;
+    std::deque<std::vector<uint8>> g_storePending;   // ready-to-inject 821 frames
+
+    void QueueStoreResponse(std::vector<uint8>&& pkt) {
+        std::lock_guard<std::mutex> lk(g_storeMutex);
+        if (g_storePending.size() < 64)
+            g_storePending.push_back(std::move(pkt));
+    }
+
+    // Deliver queued 821 frames by borrowing the carrier packet for one
+    // oRecvPkt call each (same trick as Cloud/LegacyKey). Runs on the network
+    // thread from inside the RecvPkt hook.
+    void DrainStoreResponses(void* pThis, CNetPacket* pCarrier,
+                             bool (*invokeOriginal)(void*, CNetPacket*))
+    {
+        for (;;) {
+            std::vector<uint8> pkt;
+            {
+                std::lock_guard lk(g_storeMutex);
+                if (g_storePending.empty()) return;
+                pkt = std::move(g_storePending.front());
+                g_storePending.pop_front();
+            }
+
+            uint8* origData = pCarrier->m_pubData;
+            uint32 origSize = pCarrier->m_cubData;
+            pCarrier->m_pubData = pkt.data();
+            pCarrier->m_cubData = static_cast<uint32>(pkt.size());
+            invokeOriginal(pThis, pCarrier);
+            pCarrier->m_pubData = origData;
+            pCarrier->m_cubData = origSize;
+            LOG_ACHIEVEMENT_DEBUG("StoreUserStats: delivered {}-byte synthesized response", pkt.size());
+        }
+    }
+
+    // Build + queue an 821 success frame. jobId/steamId come from the request
+    // header when present (correlates the reply); protoHdr mirrors the
+    // request envelope (raw 820 in, raw 821 out).
+    void QueueStoreSuccess(uint64_t gameId, uint32_t crc, uint64_t jobId,
+                           uint64_t steamId, bool protoHdr) {
+        CMsgClientStoreUserStatsResponse resp;
+        if (gameId) resp.set_game_id(gameId);
+        resp.set_eresult(static_cast<int32_t>(k_EResultOK));
+        resp.set_crc_stats(crc);
+
+        const uint32 cbBody = static_cast<uint32>(resp.ByteSizeLong());
+
+        uint8 hdrBuf[kMaxHdrSize];
+        uint32 cbHdr = 0;
+        if (protoHdr) {
+            CMsgProtoBufHeader respHdr;
+            if (jobId)   respHdr.set_jobid_target(jobId);
+            if (steamId) respHdr.set_steamid(steamId);
+            respHdr.set_eresult(static_cast<int32_t>(k_EResultOK));
+            cbHdr = static_cast<uint32>(respHdr.ByteSizeLong());
+            if (cbHdr > kMaxHdrSize ||
+                !respHdr.SerializeToArray(hdrBuf, kMaxHdrSize))
+                return;
+        }
+
+        const uint32 total = sizeof(MsgHdr) + cbHdr + cbBody;
+        if (cbBody > kMaxBodySize || total > kMaxPacketSize) return;
+
+        std::vector<uint8> pkt(total);
+        auto* mhdr = reinterpret_cast<MsgHdr*>(pkt.data());
+        mhdr->eMsg = static_cast<EMsg>(static_cast<uint32>(k_EMsgClientStoreUserStatsResponse) |
+                                      (protoHdr ? kMsgHdrProtoFlag : 0));
+        mhdr->headerLength = cbHdr;
+        if (cbHdr) memcpy(pkt.data() + sizeof(MsgHdr), hdrBuf, cbHdr);
+        if (!resp.SerializeToArray(pkt.data() + sizeof(MsgHdr) + cbHdr, cbBody))
+            return;
+        QueueStoreResponse(std::move(pkt));
+    }
+
+    // Shared tail: journal (or clear), notify CR, synthesize success.
+    // Returns true so the caller suppresses the outbound frame.
+    bool SuppressStore(AppId_t appId, uint64_t gameId, uint32_t crc,
+                       const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
+                       bool explicitReset,
+                       const CMsgProtoBufHeader* reqHdr, bool protoHdr) {
+        if (explicitReset)
+            LocalStats::Clear(appId);
+        else
+            LocalStats::RecordStore(appId, pairs);
+        // CloudRedirect sync keeps working off this notification.
+        CloudRedirectHost::NotifyStatsStored(appId);
+
+        uint64_t jobId = 0, steamId = 0;
+        if (reqHdr) {
+            if (reqHdr->has_jobid_source()) jobId   = reqHdr->jobid_source();
+            if (reqHdr->has_steamid())      steamId = reqHdr->steamid();
+        }
+        QueueStoreSuccess(gameId, crc, jobId, steamId, protoHdr);
+        LOG_ACHIEVEMENT_INFO("StoreUserStats: handled locally app={} ({} pair(s), reset={}), "
+                             "suppressed from server", appId, pairs.size(), explicitReset);
+        return true;
+    }
+
+    // Returns true when the frame must be suppressed (handled locally).
+    bool HandleSend_StoreUserStats(const uint8* pBody, uint32 cbBody,
+                                   const uint8* pHdr, uint32 cbHdr)
+    {
+        if (!Config::GetStatsLocalOnly()) return false;
+
+        CMsgClientStoreUserStats req;
+        if (!req.ParseFromArray(pBody, cbBody)) return false;
+        if (!req.has_game_id()) return false;
+        const AppId_t appId = static_cast<AppId_t>(req.game_id());
+        if (!LuaConfig::HasDepot(appId)) return false;   // owned: online path
+
+        std::vector<std::pair<uint32_t, uint32_t>> pairs;
+        pairs.reserve(static_cast<size_t>(req.stats_to_store_size()));
+        for (const auto& s : req.stats_to_store())
+            pairs.emplace_back(s.stat_id(), s.stat_value());
+
+        CMsgProtoBufHeader hdr;
+        const CMsgProtoBufHeader* ph =
+            hdr.ParseFromArray(pHdr, cbHdr) ? &hdr : nullptr;
+        return SuppressStore(appId, req.game_id(), 0, pairs,
+                             req.explicit_reset(), ph, /*protoHdr=*/true);
+    }
+
+    // Non-proto fallback: if 820 ever arrives without the proto flag it never
+    // reaches SendJob (UnpackRaw bails). Caught straight off the send hook;
+    // true = answered locally, suppress the real send.
+    bool HandleSend_StoreUserStats_Raw(const uint8* pubData, uint32 cubData) {
+        if (!Config::GetStatsLocalOnly()) return false;
+        if (cubData <= sizeof(MsgHdr)) return false;
+
+        CMsgClientStoreUserStats req;
+        if (!req.ParseFromArray(pubData + sizeof(MsgHdr), cubData - sizeof(MsgHdr)))
+            return false;
+        if (!req.has_game_id()) return false;
+        const AppId_t appId = static_cast<AppId_t>(req.game_id());
+        if (!LuaConfig::HasDepot(appId)) return false;   // owned: online path
+
+        std::vector<std::pair<uint32_t, uint32_t>> pairs;
+        pairs.reserve(static_cast<size_t>(req.stats_to_store_size()));
+        for (const auto& s : req.stats_to_store())
+            pairs.emplace_back(s.stat_id(), s.stat_value());
+
+        return SuppressStore(appId, req.game_id(), 0, pairs,
+                             req.explicit_reset(), nullptr, /*protoHdr=*/false);
+    }
+
+    // Returns true when the frame must be suppressed (handled locally).
+    bool HandleSend_StoreUserStats2(const uint8* pBody, uint32 cbBody,
+                                    const uint8* pHdr, uint32 cbHdr)
+    {
+        if (!Config::GetStatsLocalOnly()) return false;
+
+        CMsgClientStoreUserStats2 req;
+        if (!req.ParseFromArray(pBody, cbBody)) return false;
+        if (!req.has_game_id()) return false;
+        const AppId_t appId = static_cast<AppId_t>(req.game_id());
+        if (!LuaConfig::HasDepot(appId)) return false;   // owned: online path
+
+        std::vector<std::pair<uint32_t, uint32_t>> pairs;
+        pairs.reserve(static_cast<size_t>(req.stats_size()));
+        for (const auto& s : req.stats())
+            pairs.emplace_back(s.stat_id(), s.stat_value());
+
+        CMsgProtoBufHeader hdr;
+        const CMsgProtoBufHeader* ph =
+            hdr.ParseFromArray(pHdr, cbHdr) ? &hdr : nullptr;
+        // NOTE: 5466 has no dedicated ack message in the protocol; a best-
+        // effort 821 (game_id-keyed) is synthesized so the client can toast.
+        // If some title ignores it, the journal + library display below still
+        // hold the unlock — check achievement.log for the path games use.
+        return SuppressStore(appId, req.game_id(), req.crc_stats(), pairs,
+                             req.explicit_reset(), ph, /*protoHdr=*/true);
+    }
+
     // ── Recv: CMsgClientGetUserStatsResponse (eMsg 819) ────────
-    //     Clear donor stats, overlay CR achievements, patch eresult->OK.
+    //     Clear donor stats, overlay local journal + CR achievements, patch eresult->OK.
     bool HandleRecv_ClientGetUserStatsResponse(const uint8* pBody, uint32 cbBody)
     {
         CMsgClientGetUserStatsResponse resp;
@@ -390,7 +574,10 @@ namespace Hooks_NetPacket_UserStats {
         resp.clear_achievement_blocks();
         resp.set_eresult(1);  // k_EResultOK
 
-        // Overlay CR's cloud-synced achievement state
+        // Donor data is gone. Overlay order: CloudRedirect's synced state
+        // first (it wins on conflict), then the local journal for everything
+        // CR does not cover — progress earned locally always shows in the
+        // overlay and on the library page, with or without CR.
         const auto appId = static_cast<uint32_t>(resp.game_id());
         CloudRedirectHost::AchievementBlock blocks[64];
         uint32_t n = CloudRedirectHost::GetAchievements(appId, blocks, 64);
@@ -409,8 +596,29 @@ namespace Hooks_NetPacket_UserStats {
             resp.set_crc_stats(crc);
             LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: injected {} CR achievement blocks for app {}", n, appId);
         } else {
-            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: cleared stats/achievements (no CR data for app {})", appId);
+            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: no CR data for app {}", appId);
         }
+
+        // Local journal injection (capped so the message stays well under the
+        // replace pool). Stat values carry achievement bits, which the client
+        // maps through the schema for display.
+        constexpr size_t kMaxJournalInject = 512;
+        size_t injected = 0;
+        for (const auto& [statId, statValue] : LocalStats::GetStats(appId)) {
+            if (injected >= kMaxJournalInject) break;
+            bool covered = false;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (blocks[i].statId == statId) { covered = true; break; }
+            }
+            if (covered) continue;
+            auto* s = resp.add_stats();
+            s->set_stat_id(statId);
+            s->set_stat_value(statValue);
+            ++injected;
+        }
+        if (injected)
+            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: injected {} local stat(s) for app {}",
+                                  injected, appId);
 
         auto newSize = resp.ByteSizeLong();
         if (newSize > sizeof(g_NewBody)) {
@@ -1812,10 +2020,19 @@ namespace {
             g_NeedReplaceSend = Hooks_NetPacket_UserStats::HandleSend_ClientGetUserStats(pBody, cbBody);
             return;
 
+        case k_EMsgClientStoreUserStats: {          // 820
+            // Local-only journal + synthesized ack; suppresses the real send
+            // so nothing reaches the online profile.
+            if (Hooks_NetPacket_UserStats::HandleSend_StoreUserStats(pBody, cbBody, pHdr, cbHdr))
+                g_SuppressSend = true;
+            return;
+        }
+
         case k_EMsgClientStoreUserStats2: {         // 5466
-            AppId_t appId = Hooks_NetPacket_RichPresence::g_PlayingAppId;
-            if (appId != 0)
-                CloudRedirectHost::NotifyStatsStored(appId);
+            // Same local-only path (game_id parsed from the body, which also
+            // fixes the old g_PlayingAppId approximation).
+            if (Hooks_NetPacket_UserStats::HandleSend_StoreUserStats2(pBody, cbBody, pHdr, cbHdr))
+                g_SuppressSend = true;
             return;
         }
 
@@ -1937,6 +2154,18 @@ namespace {
             }
         }
 
+        // 820 arriving WITHOUT the proto flag never reaches SendJob
+        // (UnpackRaw bails). Journal it locally all the same so the store
+        // cannot leak to the online profile through that path.
+        if (cubData >= sizeof(MsgHdr)) {
+            const uint32 rawEMsg = *reinterpret_cast<const uint32*>(pubData);
+            if (!(rawEMsg & kMsgHdrProtoFlag) &&
+                static_cast<EMsg>(rawEMsg) == k_EMsgClientStoreUserStats &&
+                Hooks_NetPacket_UserStats::HandleSend_StoreUserStats_Raw(pubData, cubData)) {
+                return true;   // journaled locally; report success so Steam treats it as sent
+            }
+        }
+
         EMsg eMsg;
         const uint8 *pHdr, *pBody;
         uint32 cbHdr, cbBody;
@@ -1978,6 +2207,10 @@ namespace {
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 
         Hooks_NetPacket_LegacyKey::Drain(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+
+        Hooks_NetPacket_UserStats::DrainStoreResponses(
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 

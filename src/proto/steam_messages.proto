@@ -203,6 +203,52 @@ message CMsgClientGetUserStatsResponse {
 	repeated .CMsgClientGetUserStatsResponse.Achievement_Blocks achievement_blocks = 6;
 }
 
+// ============================================================
+// CMsgClientStoreUserStats (eMsg 820) / Response (eMsg 821) /
+// CMsgClientStoreUserStats2 (eMsg 5466)
+// Field layout mirrors SteamKit's steammessages_clientserver.proto.
+// Achievements travel as stat bits: SetAchievement flips a bit in a stat
+// and StoreStats ships (stat_id, stat_value) pairs — there is no separate
+// per-achievement unlock list on the wire.
+// ============================================================
+message CMsgClientStoreUserStats {
+	message Stats_To_Store {
+		optional uint32 stat_id = 1;
+		optional uint32 stat_value = 2;
+	}
+
+	optional fixed64 game_id = 1;
+	optional bool explicit_reset = 2;
+	repeated .CMsgClientStoreUserStats.Stats_To_Store stats_to_store = 3;
+}
+
+message CMsgClientStoreUserStatsResponse {
+	message Stats_Failed_Validation {
+		optional uint32 stat_id = 1;
+		optional uint32 reverted_stat_value = 2;
+	}
+
+	optional fixed64 game_id = 1;
+	optional int32 eresult = 2 [default = 2];
+	optional uint32 crc_stats = 3;
+	repeated .CMsgClientStoreUserStatsResponse.Stats_Failed_Validation stats_failed_validation = 4;
+	optional bool stats_out_of_date = 5;
+}
+
+message CMsgClientStoreUserStats2 {
+	message Stats {
+		optional uint32 stat_id = 1;
+		optional uint32 stat_value = 2;
+	}
+
+	optional fixed64 game_id = 1;
+	optional fixed64 settor_steam_id = 2;
+	optional fixed64 settee_steam_id = 3;
+	optional uint32 crc_stats = 4;
+	optional bool explicit_reset = 5;
+	repeated .CMsgClientStoreUserStats2.Stats stats = 6;
+}
+
 message CContentServerDirectory_GetManifestRequestCode_Request {
 	optional uint32 app_id = 1;
 	optional uint32 depot_id = 2;

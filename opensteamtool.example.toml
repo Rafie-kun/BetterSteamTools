@@ -82,6 +82,12 @@ enabled = true
 # SteamID when no Lua setStat(appid, "steamid") override exists.
 # Priority: setStat > stats API when enabled and valid > hardcoded preset SteamID.
 enable_api = true
+# Keep achievement unlocks for Lua-unlocked games local: stat stores are
+# journaled under <Steam>/opensteamtool/stats and answered locally (toast +
+# library still work, CloudRedirect sync still runs) instead of reaching
+# Valve, so nothing lands on the online profile. Set to false to let stores
+# flow to Valve as your account (unlocks WILL show on your profile).
+local_only = true
 
 [update]
 # Check for a newer BetterSteamTools build on startup. When a newer build is

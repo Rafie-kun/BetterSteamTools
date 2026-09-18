@@ -45,6 +45,7 @@ namespace Config {
     std::vector<std::string> GetRemoteUrlTemplates();
     CloudSettings GetCloudSettings();
     bool GetStatsEnableApi();
+    bool GetStatsLocalOnly();
     bool GetUpdateEnabled();
 
     // [donate] — contribute manifest request codes for depots this account owns.
@@ -79,6 +80,11 @@ namespace Config {
 
     // [stats]
     inline bool statsEnableApi = true;
+    // [stats] local_only — keep achievement unlocks for Lua-unlocked games
+    // local: stat stores are journaled under <Steam>/opensteamtool/stats and
+    // answered locally (toast + library still work) instead of reaching Valve,
+    // so nothing lands on the online profile. CloudRedirect sync still runs.
+    inline bool statsLocalOnly = true;
 
     // [update] - self-update check on startup (staged for next Steam launch).
     inline bool updateEnabled = true;
