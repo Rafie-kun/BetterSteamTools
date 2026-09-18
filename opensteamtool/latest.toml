@@ -1,3 +1,3 @@
-version = "v1.0.4"
-path    = "opensteamtool/v1.0.4/OpenSteamTool.dll"
-sha256  = "4bfceec4b653358152ed502904dcd2fd01e21b876ce287e508a2daed7fe50157"
+version = "v1.0.4-achievements-v2"
+path    = "opensteamtool/v1.0.4-achievements-v2/OpenSteamTool.dll"
+sha256  = "1fa487cef948a40f0e7e89579d9b49b48a0cf7f0878d3507d366a1a52792a106"
