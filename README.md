@@ -97,6 +97,7 @@ The `extract_tickets` tool dumps the `AppTicket` and `ETicket` hex strings you n
 - Uses `setStat(appid, "steamid")` to configure which SteamID's achievement data to pull.
 - If no `setStat` is configured for an app, OpenSteamTool queries `https://stats.opensteamtool.com/{appid}` when `[stats] enable_api = true` (default).
 - Priority: `setStat` > stats API when enabled and valid > hardcoded preset SteamID `76561198028121353`.
+- With `[stats] local_only = true` (default), achievement unlocks for added games stay local: stores are journaled under `<Steam>/opensteamtool/stats/` and answered locally, so toasts and the library page work, CloudRedirect sync still runs, and nothing is written to your online profile. Set `local_only = false` to let stores reach Valve (unlocks will show on your profile).
 
 ### Online Fix
 - Add `-onlinefix` to the Steam launch parameters to enable 480-based online play in games that use lobby matchmaking. The current limitation is that only one such game can run at a time.To revert, simply remove -onlinefix from the launch parameters — online play returns to normal on the next launch.

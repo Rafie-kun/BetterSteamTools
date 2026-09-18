@@ -18,6 +18,7 @@ namespace {
         std::vector<std::string> luaPaths;
         std::vector<std::string> remoteUrlTemplates;
         bool statsEnableApi = true;
+        bool statsLocalOnly = true;
         bool updateEnabled = true;
         DonateSettings donate;
         std::vector<InjectDll> injectDlls;
@@ -55,6 +56,7 @@ namespace {
         luaPaths               = snapshot.luaPaths;
         remoteUrlTemplates     = snapshot.remoteUrlTemplates;
         statsEnableApi         = snapshot.statsEnableApi;
+        statsLocalOnly         = snapshot.statsLocalOnly;
         updateEnabled          = snapshot.updateEnabled;
         donate                 = snapshot.donate;
         injectDlls             = snapshot.injectDlls;
@@ -153,6 +155,9 @@ namespace {
             if (auto stats = tbl["stats"].as_table()) {
                 if (auto val = (*stats)["enable_api"].value<bool>()) {
                     snapshot.statsEnableApi = *val;
+                }
+                if (auto val = (*stats)["local_only"].value<bool>()) {
+                    snapshot.statsLocalOnly = *val;
                 }
             }
 
@@ -287,6 +292,11 @@ namespace {
     bool GetStatsEnableApi() {
         std::lock_guard lock(g_mutex);
         return statsEnableApi;
+    }
+
+    bool GetStatsLocalOnly() {
+        std::lock_guard lock(g_mutex);
+        return statsLocalOnly;
     }
 
     DonateSettings GetDonateSettings() {
