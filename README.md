@@ -246,6 +246,15 @@ url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
 # url_template = "https://fast.jsdelivr.net/gh/OpenSteam001/steam-monitor@{channel}/{component}/{sha256}.toml"
 ```
 
+### Troubleshooting: `Invalid content configuration`
+
+If a game shows **INVALID CONTENT CONFIGURATION** in Steam's Downloads page and stays unscheduled, Steam's download job could not build the app's depot config. The tool now waits briefly for a PICS refresh before giving up on an empty depot list, but the state can still be left over from an earlier attempt. Recovery, in order:
+
+1. Press **Install** again after a few seconds — a refresh that was still landing usually succeeds on the second try.
+2. If it persists, fully exit Steam (tray → Exit), then delete `steamapps\downloading\<appid>` and `steamapps\appmanifest_<appid>.acf` for that app. Keep `depotcache\` — the manifests there are what make the next install start on the first attempt. Start Steam and install again.
+3. If the app needs an access token (protected/unreleased titles), make sure its Lua has `addtoken(<appid>, "<token>")`; without it Steam never receives the app's appinfo, so the depot list stays empty.
+4. Check `manifest.log` (Debug build) for `BuildDepotDependency: app <appid>` lines: `returned 0 depots`/`still returned 0 depots` means the depot list was empty, while `patching depot` lines show pinned manifests being applied.
+
 ### Debug logging
 
 Debug builds write per-module log files under `<Steam>/opensteamtool/`:

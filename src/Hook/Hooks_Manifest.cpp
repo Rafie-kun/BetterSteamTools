@@ -4,6 +4,7 @@
 #include "OSTPlatform/include/Thread.h"
 #include "Utils/SteamMetadata/ManifestCache.h"
 #include "OSTPlatform/include/Dialog.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <format>
@@ -61,6 +62,34 @@ namespace {
         }
     }
 
+    // An empty own-depot list is not always a transient refresh. An app whose
+    // appinfo has not landed yet has no list either, and failing the call for
+    // it makes Steam show "Failed building depot dependency (Invalid content
+    // configuration)" in the Downloads page and leaves the app unscheduled.
+    // So wait a short, bounded time for a PICS refresh to land first, and only
+    // fail when the list is still empty after that. The build runs on Steam's
+    // download-manager thread, not the UI thread, so this wait does not freeze
+    // the client.
+    constexpr int      kEmptyDepotRetryAttempts = 5;
+    constexpr uint32_t kEmptyDepotRetryFirstMs  = 200;
+    constexpr uint32_t kEmptyDepotRetryMaxMs    = 1500;
+
+    // Only wait while Steam is actually installing or updating the app.
+    // BuildDepotDependency also runs while the library is merely being
+    // inspected (right after login, when the PICS refresh is widest); sleeping
+    // through the retry for every app there would stall startup for no gain.
+    constexpr uint32 kInstallOrUpdateStates =
+        k_EAppStateUpdateRequired | k_EAppStateUpdateQueued | k_EAppStateUpdateRunning |
+        k_EAppStateUpdateStarted  | k_EAppStateUpdatePaused | k_EAppStateDownloading |
+        k_EAppStatePreallocating  | k_EAppStateStaging      | k_EAppStateCommitting |
+        k_EAppStateReconfiguring  | k_EAppStateFilesMissing | k_EAppStateFilesCorrupt;
+
+    bool IsInstallingOrUpdating(const void* pSteamApp) {
+        if (!pSteamApp) return false;
+        const auto* app = static_cast<const CSteamApp*>(pSteamApp);
+        return (static_cast<uint32>(app->AppStateFlags) & kInstallOrUpdateStates) != 0;
+    }
+
     // Record a depot whose manifest is not archived yet (404) and, after a short
     // quiet window, show a single MessageBox listing everything collected. The
     // debounce (a generation counter) coalesces the burst of a whole install —
@@ -109,6 +138,38 @@ namespace {
         });
     }
 
+    // One prompt per app per session when the depot list is still empty after
+    // the retries in BuildDepotDependency. Steam's own wording ("Invalid content
+    // configuration") says nothing about the cause, so name the app and the
+    // things that actually help. Shown detached, like ReportMissing, so Steam's
+    // download-manager thread is never blocked by the dialog.
+    std::mutex g_noDepotMutex;
+    std::set<AppId_t> g_noDepotNotified;
+
+    void ReportNoDepots(AppId_t appId) {
+        {
+            std::lock_guard<std::mutex> lock(g_noDepotMutex);
+            if (!g_noDepotNotified.insert(appId).second) return;
+        }
+        OSTPlatform::Thread::StartDetached([appId]() -> uint32_t {
+            const std::string body = std::format(
+                "Steam could not build the depot configuration for app {}.\n\n"
+                "That is the \"Invalid content configuration\" state in the Downloads page.\n\n"
+                "What to try:\n"
+                "  1. Wait a few seconds, then press Install again.\n"
+                "  2. If this app needs an access token, add\n"
+                "       addtoken({}, \"<token>\")\n"
+                "     to its Lua file; without it Steam never receives the app's appinfo.\n"
+                "  3. Still failing: exit Steam and delete\n"
+                "       steamapps\\appmanifest_{}.acf\n"
+                "       steamapps\\downloading\\{}\n"
+                "     then start Steam and install again. Keep depotcache\\.\n",
+                appId, appId, appId, appId);
+            OSTPlatform::Dialog::ShowWarning("OpenSteamTool - no depot config", body);
+            return 0;
+        });
+    }
+
     HOOK_FUNC(BuildDepotDependency, bool, void* pUserAppMgr, AppId_t AppId,
               void* pUserConfig, CUtlVector<DepotEntry>* pDepotInfo,
               CUtlVector<DepotEntry>* pSharedDepotInfo, void* pSteamApp,
@@ -133,7 +194,18 @@ namespace {
             }
         }
 
-        if (!result) return result;
+        if (!result) {
+            // Steam's own dependency build failed (bad/blanked appmanifest,
+            // missing shared depot, appinfo gone). It reports this the same way
+            // as our guard, so name the app here for diagnosis.
+            LOG_MANIFEST_WARN("BuildDepotDependency: original build failed for app {} "
+                "(Steam shows this as an invalid content configuration)", AppId);
+            return result;
+        }
+
+        const bool luaApp = AppId != 0 && LuaConfig::HasDepot(AppId, false);
+        const bool installing = IsInstallingOrUpdating(pSteamApp);
+        auto ownDepotsEmpty = [&]() { return !pDepotInfo || pDepotInfo->m_Size == 0; };
 
         // Steam reports zero depots for an app during the window where its
         // appinfo is being swapped in by a PICS refresh — the old depot set is
@@ -151,23 +223,57 @@ namespace {
         //
         // Returning false makes that caller bail on its clean failure path and
         // keep the app's previous depot config, so the next pass (once appinfo
-        // has landed) builds it properly. Scoped to apps a lua declares depots
-        // for; an app that genuinely has none is left alone.
+        // has landed) builds it properly.
         //
-        // Only pDepotInfo is tested. pSharedDepotInfo holds depots belonging to
-        // OTHER apps (sharedinstall / depotfromapp redirects — redistributables
-        // and launchers), so it says nothing about whether this app's own config
-        // is sound. Testing it too is what let app 3751260 through on 2026-09-20:
-        // its own list was empty but one shared entry (depot 228989 of app
-        // 228980) was present, so the guard missed and Steam stored the empty
-        // config, finishing with "0 mounted depots".
-        if (AppId != 0 &&
-            (!pDepotInfo || pDepotInfo->m_Size == 0) &&
-            LuaConfig::HasDepot(AppId, false))
-        {
-            LOG_MANIFEST_WARN("BuildDepotDependency: app {} returned 0 depots "
-                "(appinfo mid-refresh) — failing the call so Steam keeps its "
-                "existing depot config instead of storing an empty one", AppId);
+        // But Steam renders that false as "Failed building depot dependency
+        // (Invalid content configuration)" in the Downloads page and leaves the
+        // app unscheduled, so it must not fire on the first empty result: an
+        // appinfo refresh can land while we wait. The retry below re-runs the
+        // original builder a few times with a short backoff before the guard
+        // gives up, which turns a transient refresh into a successful build
+        // instead of a visible install error.
+        if (luaApp && installing && ownDepotsEmpty()) {
+            const uint32 sharedSize = pSharedDepotInfo ? pSharedDepotInfo->m_Size : 0;
+            uint32 delayMs = kEmptyDepotRetryFirstMs;
+            for (int attempt = 1; attempt <= kEmptyDepotRetryAttempts && ownDepotsEmpty(); ++attempt) {
+                LOG_MANIFEST_DEBUG("BuildDepotDependency: app {} has no depots yet "
+                    "(attempt {}/{}), waiting {} ms for appinfo to land",
+                    AppId, attempt, kEmptyDepotRetryAttempts, delayMs);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+
+                // The first pass produced nothing, so rebuilding from an empty
+                // vector cannot duplicate entries; truncate the shared list back
+                // to what the first pass filled in for the same reason.
+                if (pDepotInfo) pDepotInfo->m_Size = 0;
+                if (pSharedDepotInfo) pSharedDepotInfo->m_Size = sharedSize;
+
+                result = oBuildDepotDependency(pUserAppMgr, AppId, pUserConfig,
+                    pDepotInfo, pSharedDepotInfo, pSteamApp, pBuildId, pbBetaFallback);
+                if (!result) return result;
+
+                delayMs = std::min<uint32>(delayMs * 2u, kEmptyDepotRetryMaxMs);
+            }
+        }
+
+        if (luaApp && ownDepotsEmpty()) {
+            // Only pDepotInfo is tested. pSharedDepotInfo holds depots
+            // belonging to OTHER apps (sharedinstall / depotfromapp redirects —
+            // redistributables and launchers), so it says nothing about whether
+            // this app's own config is sound. Testing it too is what let app
+            // 3751260 through on 2026-09-20: its own list was empty but one
+            // shared entry (depot 228989 of app 228980) was present, so the
+            // guard missed and Steam stored the empty config, finishing with
+            // "0 mounted depots".
+            //
+            // Failing here is what Steam shows as "Invalid content
+            // configuration", so say why in the log and tell the user once,
+            // with the app id, instead of leaving them with the bare Steam
+            // string.
+            LOG_MANIFEST_WARN("BuildDepotDependency: app {} still returned 0 depots "
+                "after {} retries (appinfo mid-refresh or unresolved) — failing the "
+                "call so Steam keeps its existing depot config instead of storing an "
+                "empty one", AppId, kEmptyDepotRetryAttempts);
+            if (installing) ReportNoDepots(AppId);
             return false;
         }
 
